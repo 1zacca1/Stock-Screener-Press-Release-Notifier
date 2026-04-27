@@ -1,58 +1,60 @@
 import { fmp } from './_fmp.js';
 
-const EDGAR_SEARCH = 'https://efts.sec.gov/LATEST/search-index';
+// Public EDGAR Atom RSS feed — no auth required, always current
+const EDGAR_RSS = 'https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&dateb=&owner=include&count=40&output=atom&type=';
+const EDGAR_UA  = 'InvestmentResearch research@example.com';
 
-// Forms that signal event-driven opportunities
-const EVENT_FORMS = ['SC TO-T', 'SC TO-I', 'SC 13E-3', '15-12G', '25'];
+const FORM_LABELS = {
+  'SC TO-T':  'Tender Offer',
+  'SC TO-I':  'Issuer Tender',
+  'SC 13E-3': 'Going Private',
+  '15-12G':   'Deregistration',
+  '25':       'Delisting',
+  'NEWS':     'News',
+};
 
-async function fetchEdgar(forms, daysBack = 90) {
-  const startdt = new Date(Date.now() - daysBack * 86400000).toISOString().slice(0, 10);
-  const url =
-    `${EDGAR_SEARCH}?forms=${encodeURIComponent(forms.join(','))}` +
-    `&dateRange=custom&startdt=${startdt}`;
+// Minimal Atom XML parser — no external deps
+function parseAtom(xml) {
+  const items = [];
+  const entries = [...xml.matchAll(/<entry>([\s\S]*?)<\/entry>/g)];
 
-  const res = await fetch(url, {
-    headers: { 'User-Agent': 'InvestmentResearch research@example.com' },
-    signal: AbortSignal.timeout(8000),
-  });
-  if (!res.ok) throw new Error(`EDGAR ${res.status}`);
-  return res.json();
-}
+  for (const [, entry] of entries) {
+    const title   = (entry.match(/<title[^>]*>\s*(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?\s*<\/title>/)   ?.[1] ?? '').trim();
+    const updated = (entry.match(/<updated>(.*?)<\/updated>/)                                           ?.[1] ?? '').slice(0, 10);
+    const link    = (entry.match(/<link[^>]+href="([^"]+)"/)                                            ?.[1] ?? '');
+    const summary = (entry.match(/<summary[^>]*>\s*(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?\s*<\/summary>/)?.[1] ?? '').trim();
 
-function edgarLabel(formType) {
-  const map = {
-    'SC TO-T':  'Tender Offer',
-    'SC TO-I':  'Issuer Tender',
-    'SC 13E-3': 'Going Private',
-    '15-12G':   'Deregistration',
-    '25':       'Delisting',
-  };
-  return map[formType] || formType;
-}
+    // EDGAR title format: "SC TO-T - COMPANY NAME (CIK 0001234567)"
+    const formMatch    = title.match(/^(SC[\s\w-]+?\d*[A-Z]?|15-12[A-Z]|25)\s*-\s*/i);
+    const formType     = formMatch ? formMatch[1].toUpperCase() : '';
+    const companyPart  = formMatch ? title.slice(formMatch[0].length) : title;
+    const company      = companyPart.replace(/\(CIK\s*\d+\)/i, '').trim();
+    const tickerMatch  = summary.match(/\bTicker\s*(?:Symbol)?:\s*([A-Z]+)\b/i);
+    const ticker       = tickerMatch ? tickerMatch[1] : '';
 
-function parseEdgar(data) {
-  const hits = data?.hits?.hits ?? [];
-  return hits.map(hit => {
-    const s = hit._source ?? {};
-    const formType = s.form_type ?? '';
-    const company  = s.display_names?.[0] ?? s.entity_name ?? '';
-    const ticker   = s.tickers?.[0] ?? '';
-    const fileNum  = s.file_num ?? '';
-    const url = fileNum
-      ? `https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&filenum=${encodeURIComponent(fileNum)}&type=&dateb=&owner=include&count=10`
-      : null;
-
-    return {
-      type:    formType,
-      label:   edgarLabel(formType),
-      title:   company || 'Filing',
+    items.push({
+      type:    formType || 'FILING',
+      label:   FORM_LABELS[formType] || formType || 'Filing',
+      title:   company || title,
       company,
       ticker,
-      date:    s.file_date ?? '',
-      url,
+      date:    updated,
+      url:     link || null,
       region:  'US',
-    };
-  }).filter(f => f.company || f.title);
+    });
+  }
+  return items;
+}
+
+async function fetchEdgarFeed(formType) {
+  const url = `${EDGAR_RSS}${encodeURIComponent(formType)}`;
+  const res = await fetch(url, {
+    headers: { 'User-Agent': EDGAR_UA },
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!res.ok) throw new Error(`EDGAR feed ${res.status} for ${formType}`);
+  const xml = await res.text();
+  return parseAtom(xml);
 }
 
 export default async function handler(req, res) {
@@ -60,28 +62,40 @@ export default async function handler(req, res) {
 
   try {
     const region = req.query.region === 'eu' ? 'eu' : 'us';
-
     let items = [];
 
     if (region === 'us') {
-      // SEC EDGAR: tender offers, going-private, delistings
-      const [tenderRes, deregRes] = await Promise.allSettled([
-        fetchEdgar(['SC TO-T', 'SC TO-I', 'SC 13E-3']),
-        fetchEdgar(['15-12G', '25']),
+      // Fetch four form types in parallel; EDGAR RSS is public/free
+      const feeds = await Promise.allSettled([
+        fetchEdgarFeed('SC TO-T'),
+        fetchEdgarFeed('SC TO-I'),
+        fetchEdgarFeed('SC 13E-3'),
+        fetchEdgarFeed('15-12G'),
+        fetchEdgarFeed('25'),
       ]);
 
-      if (tenderRes.status === 'fulfilled') items.push(...parseEdgar(tenderRes.value));
-      if (deregRes.status  === 'fulfilled') items.push(...parseEdgar(deregRes.value));
+      for (const f of feeds) {
+        if (f.status === 'fulfilled') items.push(...f.value);
+        else console.warn('EDGAR feed error:', f.reason?.message);
+      }
+
+      // De-duplicate by title+date
+      const seen = new Set();
+      items = items.filter(it => {
+        const key = `${it.title}|${it.date}|${it.type}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
 
     } else {
-      // EU: FMP general news filtered for M&A / event-driven keywords
-      // (EU regulatory filings live on national regulators: FCA, AMF, BaFin, etc.)
+      // EU: FMP news filtered for M&A / event-driven keywords
       try {
         const news = await fmp('stock_news?limit=100');
         if (Array.isArray(news)) {
-          const euKeywords = /acqui|tender offer|merger|going.private|spin.?off|delist|takeover|buyout|privatisation|privatization/i;
+          const pat = /acqui|tender offer|merger|going.private|spin.?off|delist|takeover|buyout|privatisa|privatiza/i;
           items = news
-            .filter(n => euKeywords.test(n.title + ' ' + (n.text ?? '')))
+            .filter(n => pat.test(n.title + ' ' + (n.text ?? '')))
             .slice(0, 40)
             .map(n => ({
               type:    'NEWS',
@@ -94,13 +108,15 @@ export default async function handler(req, res) {
               region:  'EU',
             }));
         }
-      } catch {}
+      } catch (e) {
+        console.warn('FMP news failed:', e.message);
+      }
     }
 
     // Sort newest first
     items.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+    res.status(200).json(items.slice(0, 60));
 
-    res.status(200).json(items.slice(0, 50));
   } catch (err) {
     console.error('[news-filings]', err);
     res.status(500).json({ error: err.message });
